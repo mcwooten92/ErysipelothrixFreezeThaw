@@ -1,0 +1,1696 @@
+---
+title: "Freeze/Thaw Analyses"
+author: "McCaide Wooten"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Setup
+
+## Packages, Paths, and Constants
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mgcv)
+library(gratia)
+library(MASS)
+library(systemfonts)
+library(ragg)
+library(forcats)
+library(patchwork)
+library(beepr)
+select <- dplyr::select
+
+theme_set(theme_bw(base_size = 11))
+
+DATA_PATH <- "C:/INSERT FILE PATH HERE/Freeze-Thaw Working Dataset.xlsx"
+
+## Detection limits back-calculated from the drop-plate method
+## (6 x 10 uL drops; smallest quantifiable result = 1 colony across 6 drops
+##  = (1/6)/0.010 mL = 16.67 CFU/mL, read from the undiluted drop).
+##   broth: 16.67 CFU/mL
+##   soil : 16.67 x 10 for the 1:10 soil:PBS slurry step -> 166.7 CFU/g
+LOD <- c(soil = 166.6667, broth = 16.6667)
+
+K_GLOBAL  <- 10    # basis size for the global smooth of time (13 unique times, so k <= 13)
+K_GROUP   <- 8     # basis size for group-level smooths
+NSIM      <- 4000  # posterior draws for contrasts / AUC / crossing times
+TMAX      <- 100   # trial length, days
+GRID_STEP <- 0.5   # spacing of the posterior evaluation grid, days
+P_CROSSED <- 0.90  # min. share of draws that must cross before a TTT is reported
+SEED      <- 2026
+
+## Analytical threshold: a 4 log10 (99.99%) reduction from baseline. Applied to
+## all relative-scale models as the reference level for AUC, the day-100 margin, and the time to
+## 99.99% reduction.
+THR_REL <- -4
+
+## The absolute-scale broth sensitivity models predict log10 CFU/mL. Those models are
+## floored at 0 instead, i.e. 1 CFU/mL.
+THR_BROTH_ABS <- 0
+```
+
+## Shared Functions
+
+```{r}
+## Scale parameter: cnorm stores the SD as exp(theta); getTheta(TRUE) returns
+## it on the SD scale. Falls back to sqrt(sig2) for Gaussian fits.
+get_sigma <- function(m) {
+  if (!is.null(m$family$getTheta)) {
+    th <- try(m$family$getTheta(TRUE), silent = TRUE)
+    if (!inherits(th, "try-error") && length(th) >= 1) return(as.numeric(th[1]))
+  }
+  sqrt(m$sig2)
+}
+
+## ---- mgcv version guard and censored-Gaussian AIC check -----------------
+## mgcv 1.9-4's cnorm()$aic misclassifies uncensored observations <= 0 as
+## left-censored (`yat <= 0` instead of `yat == -Inf`) and drops log(sigma) from
+## the uncensored density. This analysis is pinned to version 1.9-3.
+if (packageVersion("mgcv") == "1.9-4")
+  stop("mgcv 1.9-4 reports incorrect AIC for cnorm models; install 1.9-3.")
+
+## Direct censored-Gaussian log-likelihood (prior weights scale the SD as
+## sigma / sqrt(w)). Used only to confirm AIC() is right, so a future mgcv
+## update can't silently change the model comparison.
+cnorm_loglik <- function(m) {
+  yy  <- model.response(model.frame(m))
+  y   <- yy[, 1]; yat <- yy[, 2]
+  mu  <- as.vector(m$linear.predictors)
+  s   <- get_sigma(m) / sqrt(m$prior.weights)
+  sum(ifelse(yat == -Inf,
+             pnorm(y, mu, s, log.p = TRUE),
+             dnorm(y, mu, s, log = TRUE)))
+}
+
+cnorm_aic_ok <- function(m, tol = 1e-6) {
+  if (!grepl("^cnorm", m$family$family)) return(TRUE)
+  abs(as.numeric(logLik(m)) - cnorm_loglik(m)) < tol
+}
+
+## Brier and logarithmic scores for the model-implied non-detection pattern.
+score_detect <- function(d, label) {
+  d %>%
+    group_by(model) %>%
+    summarise(subset   = label,
+              n        = n(),
+              observed = sum(censored),
+              expected = round(sum(p_below), 1),
+              brier    = round(mean((p_below - as.numeric(censored))^2), 4),
+              logscore = round(-mean(ifelse(censored,
+                                            log(pmax(p_below, 1e-12)),
+                                            log(pmax(1 - p_below, 1e-12)))), 4),
+              .groups  = "drop")
+}
+
+# ---- Fitted values over a grid --------------------------
+pred_grid <- function(m, nd, label, tag = "model") {
+  p <- predict(m, newdata = nd, se.fit = TRUE)
+  out <- transform(nd, fit = as.vector(p$fit), se = as.vector(p$se.fit))
+  out[[tag]] <- label
+  out
+}
+
+# ---- Posterior simulation -------------------------------
+## Draws of the linear predictor over a prediction grid. vcov is corrected for
+## smoothing-parameter uncertainty (unconditional = TRUE).
+post_draws <- function(m, nd, nsim = NSIM) {
+  Xp <- predict(m, newdata = nd, type = "lpmatrix")
+  V  <- vcov(m, unconditional = TRUE)
+  b  <- MASS::mvrnorm(nsim, coef(m), V)
+  Xp %*% t(b)
+}
+
+## Per-draw summary statistics. Every one takes the same (y, t, thr) signature
+## so a single dispatcher can drive them all; statistics with no threshold
+## simply ignore thr.
+first_cross <- function(y, t, thresh) {
+  below <- y <= thresh
+  if (!any(below)) return(NA_real_)
+  t[which.max(below)]
+}
+
+auc_floored <- function(y, t, thresh) {
+  z <- pmax(y - thresh, 0)
+  sum(diff(t) * (head(z, -1) + tail(z, -1)) / 2)
+}
+
+stat_auc     <- function(y, t, thr) auc_floored(y, t, thr)   # soil persistence
+stat_margin  <- function(y, t, thr) y[length(y)] - thr       # day-100 margin
+stat_ttt     <- function(y, t, thr) first_cross(y, t, thr)   # time to threshold
+
+## Dispatcher. Applies a per-draw statistic across the levels of any grouping
+## factor. thr is either a single value (THR_REL for every relative-scale model,
+## THR_BROTH_ABS for the absolute-scale broth sensitivity) or a vector named by
+## level, giving each level its own threshold (own-floor sensitivity).
+by_group_stat <- function(D, nd, gvar, fun, thr = NA_real_) {
+  g    <- nd[[gvar]]
+  levs <- levels(g)
+  if (length(thr) > 1 && !all(levs %in% names(thr)))
+    stop("thr has more than one value but is not named for every level of ", gvar)
+  bind_rows(lapply(levs, function(s) {
+    idx   <- which(g == s)
+    thr_s <- if (length(thr) > 1) unname(thr[[s]]) else unname(thr)
+    v     <- apply(D[idx, , drop = FALSE], 2, fun,
+                   t = nd$time[idx], thr = thr_s)
+    tibble::tibble(level = s, draw = seq_along(v), value = as.numeric(v))
+  })) %>%
+    mutate(level = factor(level, levels = levs)) %>%
+    rename(!!gvar := level)
+}
+
+## The three reported metrics, computed together for one set of posterior
+## draws. Every model gets the same set.
+metric_set <- function(D, nd, gvar, thr,
+                       ttt_label = "time to 99.99% reduction") bind_rows(
+  by_group_stat(D, nd, gvar, stat_auc,    thr) %>% mutate(stat = "AUC"),
+  by_group_stat(D, nd, gvar, stat_margin, thr) %>% mutate(stat = "day-100 margin"),
+  by_group_stat(D, nd, gvar, stat_ttt,    thr) %>% mutate(stat = ttt_label)
+)
+
+## Posterior summary of a per-draw metric, for any grouping variable.
+summarise_stat <- function(d, gvar) {
+  d %>%
+    group_by(across(any_of("fit")), .data[[gvar]]) %>%
+    summarise(p_above   = round(mean(value > 0, na.rm = TRUE), 3),
+              p_crossed = round(mean(!is.na(value)), 3),
+              median = median(value, na.rm = TRUE),
+              q25 = quantile(value, 0.25, na.rm = TRUE),
+              q75 = quantile(value, 0.75, na.rm = TRUE),
+              lwr = quantile(value, 0.025, na.rm = TRUE),
+              upr = quantile(value, 0.975, na.rm = TRUE),
+              skew = (quantile(value, 0.975, na.rm = TRUE) - median(value, na.rm = TRUE)) /
+                     (median(value, na.rm = TRUE) - quantile(value, 0.025, na.rm = TRUE)),
+              .groups = "drop") %>%
+    mutate(across(c(median, q25, q75, lwr, upr, skew), ~ round(.x, 2)))
+}
+
+## Differences taken within draw. pairs = NULL gives every pairwise
+## combination; supply a list of pairs for the within-strain regime comparisons.
+contrast_draws <- function(d, gvar, label, pairs = NULL) {
+  wide <- d %>%
+    select(all_of(c(gvar, "draw", "value"))) %>%
+    tidyr::pivot_wider(names_from = all_of(gvar), values_from = value)
+  levs <- setdiff(names(wide), "draw")
+  if (is.null(pairs)) pairs <- utils::combn(levs, 2, simplify = FALSE)
+  bind_rows(lapply(pairs, function(p) {
+    if (!all(p %in% names(wide))) return(NULL)
+    dif <- wide[[p[1]]] - wide[[p[2]]]
+    tibble::tibble(
+      stat     = label,
+      contrast = paste0(p[1], " - ", p[2]),
+      n_usable = sum(!is.na(dif)),
+      median   = median(dif, na.rm = TRUE),
+      lwr      = quantile(dif, 0.025, na.rm = TRUE),
+      upr      = quantile(dif, 0.975, na.rm = TRUE),
+      p_gt0    = mean(dif > 0, na.rm = TRUE)
+    )
+  })) %>%
+    mutate(excludes_0 = (lwr > 0 | upr < 0),
+           across(c(median, lwr, upr), ~ round(.x, 2)))
+}
+
+## Do two contrast tables reach the same conclusion? Used by every sensitivity
+## analysis (absolute-scale broth, GI penalty order, own-floor thresholds).
+sens_agree <- function(ca, cb, label, names_ab = c("a", "b")) {
+  bind_rows(mutate(ca, fit = names_ab[1]), mutate(cb, fit = names_ab[2])) %>%
+    select(fit, contrast, excludes_0) %>%
+    tidyr::pivot_wider(names_from = fit, values_from = excludes_0) %>%
+    mutate(stat  = label,
+           agree = .data[[names_ab[1]]] == .data[[names_ab[2]]])
+}
+
+## Contrast agreement across every metric in two contrast tables.
+sens_agree_all <- function(ca, cb, names_ab) {
+  bind_rows(lapply(intersect(unique(ca$stat), unique(cb$stat)), function(st)
+    sens_agree(filter(ca, stat == st), filter(cb, stat == st), st, names_ab)))
+}
+
+## ---- Table-ready strings for supplementary tables -----------------------
+## "201 (174, 232)" for estimates; for unreportable times "NA; 80.4%" (share of
+## draws that crossed), so it can't be misread as a range.
+fmt_est <- function(med, lwr, upr, digits = 3) {
+  f <- function(x) trimws(formatC(signif(x, digits), format = "fg", digits = digits))
+  ifelse(is.na(med), NA_character_, paste0(f(med), " (", f(lwr), ", ", f(upr), ")"))
+}
+fmt_ttr <- function(med, lwr, upr, p_crossed, reportable) {
+  ifelse(reportable, fmt_est(med, lwr, upr),
+         paste0("NA; ", formatC(100 * p_crossed, format = "f", digits = 1), "%"))
+}
+```
+
+# Data Handling
+
+## Load and Type
+
+```{r}
+ft_raw <- read_excel(DATA_PATH, sheet = "Data")
+
+ft <- ft_raw %>%
+  mutate(
+    strain    = factor(strain, levels = 1:6),
+    medium    = factor(medium, levels = c("broth", "soil")),
+    group     = factor(group,  levels = c("exp", "plus10C", "minus10C")),
+    replicate = factor(replicate),
+    series    = interaction(strain, medium, group, drop = TRUE, sep = "_"),
+    lod       = unname(LOD[as.character(medium)]),
+    censored  = concentration == 0
+  )
+```
+
+## Strain Metadata
+
+```{r}
+strain_meta <- tibble::tribble(
+  ~strain, ~species,           ~clade,       ~host,        ~is_AC,
+  "1",     "E. rhusiopathiae", "2",          "Poultry",    FALSE,
+  "2",     "E. rhusiopathiae", "2",          "Arctic fox", FALSE,
+  "3",     "E. rhusiopathiae", "3 (non-AC)", "Swine",      FALSE,
+  "4",     "E. rhusiopathiae", "3 (non-AC)", "Muskox",     FALSE,
+  "5",     "E. rhusiopathiae", "3 (AC)",     "Muskox",     TRUE,
+  "6",     "E. qupirruqcola",  NA,           "Larvae",     FALSE
+) %>%
+  mutate(strain = factor(strain, levels = 1:6))
+
+ft <- left_join(ft, strain_meta, by = "strain")
+
+## Facet/axis labels used by every diagnostic plot below.
+strain_labs <- with(
+  strain_meta,
+  setNames(
+    paste0(strain, ": ", host, " — ",
+           ifelse(is.na(clade), "E. qupirruqcola", paste0("clade ", clade))),
+    as.character(strain)
+  )
+)
+```
+
+## Culture Stopping Rule
+
+```{r}
+## Protocol: culturing stopped once a strain/medium was negative at two
+## successive timepoints.
+stop_rule <- tibble::tibble(
+  strain     = factor("3", levels = 1:6),
+  medium     = factor("soil", levels = c("broth", "soil")),
+  group      = factor("exp", levels = c("exp", "plus10C", "minus10C")),
+  stop_after = 30
+)
+
+ft <- ft %>%
+  left_join(stop_rule, by = c("strain", "medium", "group")) %>%
+  mutate(stop_after = ifelse(is.na(stop_after), Inf, stop_after),
+         measured   = time <= stop_after) %>%
+  select(-stop_after)
+```
+
+## Baselines and Response Construction
+
+```{r}
+## Baseline = mean log10 concentration of the three day-0 replicates, per
+## strain/medium/regime series. The response is the log10 fold change from that
+## baseline. Non-detections take the LOD in y_obs (used for plotting and for
+## the Gaussian broth fits) and -Inf in y_cens, which is what cnorm() reads as
+## "left censored at y_obs". y_abs is the same quantity on the absolute scale,
+## used by the two absolute-scale broth models.
+stopifnot(all(ft$concentration[ft$time == 0] > 0))
+
+baselines <- ft %>%
+  filter(time == 0) %>%
+  group_by(series) %>%
+  summarise(log10_baseline = mean(log10(concentration)), .groups = "drop")
+
+ft <- left_join(ft, baselines, by = "series") %>%
+  mutate(
+    y_abs  = log10(ifelse(censored, lod, concentration)),
+    y_obs  = y_abs - log10_baseline,
+    y_cens = ifelse(censored, -Inf, y_obs)
+  )
+
+# ---- Analysis subsets ------------------------------------------------------
+ft_exp   <- filter(ft, group == "exp") %>% droplevels()
+ft_broth <- filter(ft_exp, medium == "broth") %>% droplevels()
+ft_soil  <- filter(ft_exp, medium == "soil")  %>% droplevels()
+```
+
+## Detection Limits vs Analytical Threshold
+
+```{r}
+lod_rel <- ft %>%
+  distinct(series, strain, medium, group, lod, log10_baseline) %>%
+  mutate(y_lod = log10(lod) - log10_baseline)
+
+## Which series could resolve a 4-log decline directly, and how far below its
+## own detection floor each of the others has to be extrapolated to get there.
+lod_rel %>%
+  filter(medium == "soil") %>%
+  transmute(series,
+            own_floor       = round(y_lod, 3),
+            resolvable_at_4 = y_lod <= THR_REL,
+            extrapolated_log = round(pmax(y_lod - THR_REL, 0), 3),
+            truncated_log    = round(pmax(THR_REL - y_lod, 0), 3)) %>%
+  arrange(desc(own_floor))
+
+```
+
+## Data Checks and Cell Summaries
+
+```{r}
+stopifnot(nrow(ft) == 780)
+stopifnot(all(count(ft, series, time)$n == 3))
+stopifnot(all(is.finite(ft$y_obs)))
+stopifnot(sum(!ft$measured) == 21)
+stopifnot(all(ft$censored[!ft$measured]))
+
+ft %>%
+  group_by(medium, group) %>%
+  summarise(n = n(),
+            n_censored = sum(censored),
+            n_imputed  = sum(!measured),
+            min_y = min(y_obs), max_y = max(y_obs), .groups = "drop")
+
+## Replicate-level spread
+cell_stats <- ft_exp %>%
+  group_by(medium, strain, time) %>%
+  summarise(mean_y = mean(y_obs), sd_y = sd(y_obs),
+            n_cens = sum(censored), .groups = "drop")
+
+## Censoring map: how many of the 3 soil replicates were non-detects
+ft_soil %>%
+  group_by(strain, time) %>%
+  summarise(n_cens = sum(censored), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = strain, values_from = n_cens,
+                     names_prefix = "S")
+```
+
+## Orientation Plots
+
+```{r}
+# ---- All experimental trajectories, both media -----------------------------
+## Dotted red = each series' own analytical floor; solid red = THR_REL (-4).
+ggplot(ft_exp, aes(x = time, y = y_obs)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_hline(data = tibble::tibble(medium = factor("soil", levels = levels(ft$medium))),
+             aes(yintercept = THR_REL), colour = "firebrick", linewidth = 0.5) +
+  geom_segment(data = filter(lod_rel, group == "exp"),
+               aes(x = 0, xend = TMAX, y = y_lod, yend = y_lod),
+               linetype = 3, colour = "firebrick", inherit.aes = FALSE) +
+  geom_point(aes(shape = censored), alpha = 0.55, size = 1.4) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 0.7) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2),
+                     labels = c("detected", "below LOD")) +
+  facet_grid(medium ~ strain, labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day (= freeze/thaw cycles)",
+       y = expression(log[10]~fold~change~from~baseline), shape = NULL) +
+  theme(legend.position = "bottom")
+
+# ---- Replicate spread vs time and vs level ---------------------------------
+ggplot(cell_stats, aes(time, sd_y, colour = strain)) +
+  geom_point(aes(size = n_cens > 0)) +
+  geom_line(aes(group = strain), alpha = 0.6) +
+  scale_size_manual(values = c(`FALSE` = 1.3, `TRUE` = 2.6), guide = "none") +
+  facet_wrap(~ medium) +
+  labs(x = "Day", y = "SD of the 3 replicates (log10 units)")
+
+ggplot(cell_stats, aes(mean_y, sd_y, colour = medium)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.7) +
+  labs(x = "Cell mean (log10 fold change)", y = "Cell SD (log10 units)")
+
+# ---- Cycling vs constant temperature, strains 4 and 6 ----------------------
+ggplot(filter(ft, strain %in% c("4", "6")) %>% droplevels(),
+       aes(x = time, y = y_obs, colour = group)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(alpha = 0.5, size = 1.3) +
+  stat_summary(fun = mean, geom = "line", aes(group = group), linewidth = 0.8) +
+  facet_grid(medium ~ strain, labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline),
+       colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+# Model Structure
+
+## Candidate Structures
+
+```{r}
+# ---- The five Pedersen structures, plus m-variants of GI and I --------------
+## pc = 0 pins each smooth at zero on day 0; "- 1" removes the intercept so the
+## fitted value is zero there too, not just the smooth.
+## GI uses a first-derivative (m = 1) penalty on the strain smooths, as in
+## Pedersen et al. (2019). GI_m2 and I_m1 complete a 2 x 2 of {global term
+## present/absent} x {strain-smooth penalty order}, so AIC can separate the two.
+## Note: with pc = 0, an m = 2 strain smooth keeps an unpenalized linear slope
+## (edf >= 1); an m = 1 strain smooth can shrink all the way to zero.
+hgam_forms <- list(
+  G     = ~ s(time, k = K_GLOBAL, m = 2, pc = 0) - 1,
+
+  GS    = ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+            s(time, strain, bs = "fs", k = K_GROUP, m = 2, pc = 0) - 1,
+
+  GI    = ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+            s(time, by = strain, k = K_GROUP, m = 1, pc = 0) - 1,
+
+  GI_m2 = ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+            s(time, by = strain, k = K_GROUP, m = 2, pc = 0) - 1,
+
+  S     = ~ s(time, strain, bs = "fs", k = K_GROUP, m = 2, pc = 0) - 1,
+
+  I     = ~ s(time, by = strain, k = K_GROUP, m = 2, pc = 0) - 1,
+
+  I_m1  = ~ s(time, by = strain, k = K_GROUP, m = 1, pc = 0) - 1
+)
+
+## Fallbacks: the "fs" basis construction does not accept pc, so GS and S
+## revert to the unconstrained form, which needs its intercept back.
+hgam_alt <- list(
+  GS = ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+         s(time, strain, bs = "fs", k = K_GROUP, m = 2),
+  S  = ~ s(time, strain, bs = "fs", k = K_GROUP, m = 2)
+)
+
+## Verify the formulas before committing to any fitting
+lapply(hgam_forms, update, y_obs ~ .)
+```
+
+## Fit Both Media
+
+```{r}
+## Broth: Gaussian (no non-detections occurred in broth).
+## Soil : censored Gaussian (cnorm), left censored at each series' own LOD.
+fit_one <- function(f, lhs, data, fam_fn, f_alt = NULL) {
+  out <- tryCatch(
+    list(fit  = gam(update(f, lhs), data = data, family = fam_fn(),
+                    method = "REML"),
+         spec = "pc", note = NA_character_),
+    error = function(e) list(fit = NULL, spec = NA_character_,
+                             note = conditionMessage(e))
+  )
+  if (is.null(out$fit) && !is.null(f_alt)) {
+    first_note <- out$note
+    out <- tryCatch(
+      list(fit  = gam(update(f_alt, lhs), data = data, family = fam_fn(),
+                      method = "REML"),
+           spec = "no_pc", note = first_note),
+      error = function(e) list(fit = NULL, spec = NA_character_,
+                               note = conditionMessage(e))
+    )
+  }
+  out
+}
+
+fit_hgam_set <- function(data, lhs, fam_fn) {
+  setNames(lapply(names(hgam_forms), function(nm) {
+    fit_one(hgam_forms[[nm]], lhs, data, fam_fn, hgam_alt[[nm]])
+  }), names(hgam_forms))
+}
+
+m_broth <- fit_hgam_set(ft_broth, y_obs ~ .,                gaussian)
+m_soil  <- fit_hgam_set(ft_soil,  cbind(y_obs, y_cens) ~ .,  cnorm)
+```
+
+# Model Selection, Verification, and Variations
+
+## AIC Comparison and Candidate Curves
+
+```{r}
+compare_hgam <- function(mods, label) {
+  ok <- !vapply(mods, function(x) is.null(x$fit), logical(1))
+  for (nm in names(mods)[!ok])
+    message(label, " / ", nm, " failed: ", mods[[nm]]$note)
+  for (nm in names(mods)[ok])
+    if (identical(mods[[nm]]$spec, "no_pc"))
+      message(label, " / ", nm, " fell back to no-pc: ", mods[[nm]]$note)
+  mods <- mods[ok]
+
+  tibble::tibble(
+    medium   = label,
+    model    = names(mods),
+    spec     = vapply(mods, function(x) x$spec, character(1)),
+    n_sp     = vapply(mods, function(x) length(x$fit$sp), integer(1)),
+    edf      = vapply(mods, function(x) sum(x$fit$edf), numeric(1)),
+    dev_expl = vapply(mods, function(x) summary(x$fit)$dev.expl, numeric(1)),
+    REML     = vapply(mods, function(x) as.numeric(x$fit$gcv.ubre), numeric(1)),
+    logLik   = vapply(mods, function(x) as.numeric(logLik(x$fit)), numeric(1)),
+    AIC      = vapply(mods, function(x) AIC(x$fit), numeric(1)),
+    aic_ok   = vapply(mods, function(x) cnorm_aic_ok(x$fit), logical(1))
+  ) %>%
+    arrange(AIC) %>%
+    mutate(dAIC = AIC - min(AIC), .after = AIC)
+}
+
+aic_tab <- bind_rows(compare_hgam(m_broth, "broth"), compare_hgam(m_soil, "soil"))
+stopifnot(all(aic_tab$aic_ok))   # cnorm AIC() matches the direct likelihood
+print(aic_tab %>% mutate(across(c(edf, dev_expl, REML, logLik, AIC, dAIC), ~ round(.x, 2))),
+      n = Inf, width = Inf)
+
+## The 2 x 2 that separates the global term from penalty order
+aic_tab %>%
+  filter(model %in% c("GI", "GI_m2", "I_m1", "I")) %>%
+  mutate(global  = ifelse(grepl("^GI", model), "global + strain", "strain only"),
+         penalty = ifelse(model %in% c("GI", "I_m1"), "m = 1", "m = 2")) %>%
+  select(medium, global, penalty, AIC) %>%
+  mutate(AIC = round(AIC, 1)) %>%
+  tidyr::pivot_wider(names_from = penalty, values_from = AIC) %>%
+  select(medium, global, `m = 1`, `m = 2`)
+
+# ---- Do the point constraints behave? Fitted values at day 0 and day 100 ---
+endpoint_check <- function(mods, data, label, at) {
+  nd <- expand.grid(time = at,
+                    strain = factor(levels(data$strain),
+                                    levels = levels(data$strain)))
+  bind_rows(lapply(names(mods), function(nm) {
+    if (is.null(mods[[nm]]$fit)) return(NULL)
+    tibble::tibble(medium = label, model = nm, strain = nd$strain, day = at,
+                   fit = as.vector(predict(mods[[nm]]$fit, newdata = nd)))
+  })) %>%
+    tidyr::pivot_wider(names_from = strain, values_from = fit,
+                       names_prefix = "S")
+}
+
+endpoints <- bind_rows(
+  endpoint_check(m_broth, ft_broth, "broth", 0),
+  endpoint_check(m_soil,  ft_soil,  "soil",  0),
+  endpoint_check(m_broth, ft_broth, "broth", TMAX),
+  endpoint_check(m_soil,  ft_soil,  "soil",  TMAX)
+)
+
+## Day 0: should be 0 to machine precision for every "pc" model; GS and S
+## (no_pc fallbacks) carry their fitted intercept instead.
+print(endpoints %>% filter(day == 0) %>%
+        mutate(across(starts_with("S"), ~ signif(.x, 2))),
+      n = Inf, width = Inf)
+
+## Day 100: where each candidate ends up (soil curves can extrapolate far below
+## the detection floor here, which is the point of checking).
+print(endpoints %>% filter(day == TMAX) %>%
+        mutate(across(starts_with("S"), ~ round(.x, 2))),
+      n = Inf, width = Inf)
+
+# ---- Candidate curves ------------------------------------------------------
+Y_WINDOW <- c(-6, 1)
+
+newd <- expand.grid(
+  time   = seq(0, TMAX, length.out = 200),
+  strain = factor(levels(ft_soil$strain), levels = levels(ft_soil$strain))
+)
+
+pred_set <- function(mods) {
+  bind_rows(lapply(names(mods), function(nm) {
+    if (is.null(mods[[nm]]$fit)) return(NULL)
+    p <- predict(mods[[nm]]$fit, newdata = newd, se.fit = TRUE)
+    transform(newd, fit = as.vector(p$fit), se = as.vector(p$se.fit),
+              model = factor(nm, levels = names(hgam_forms)))
+  }))
+}
+
+ggplot(pred_set(m_soil), aes(time, fit, colour = model)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_hline(yintercept = THR_REL, colour = "firebrick", linewidth = 0.5) +
+  geom_point(data = ft_soil, aes(time, y_obs, shape = censored),
+             inherit.aes = FALSE, alpha = 0.35, size = 1.1) +
+  geom_line(linewidth = 0.75) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2), guide = "none") +
+  coord_cartesian(ylim = Y_WINDOW) +
+  facet_wrap(~ strain, labeller = labeller(strain = strain_labs), ncol = 3) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline),
+       colour = NULL, title = "Soil",
+       caption = "y-axis clipped at -6; some fitted curves extend below") +
+  theme(legend.position = "bottom")
+
+ggplot(pred_set(m_broth), aes(time, fit, colour = model)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(data = ft_broth, aes(time, y_obs),
+             inherit.aes = FALSE, alpha = 0.35, size = 1.1) +
+  geom_line(linewidth = 0.75) +
+  facet_wrap(~ strain, labeller = labeller(strain = strain_labs), ncol = 3) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline),
+       colour = NULL, title = "Broth") +
+  theme(legend.position = "bottom")
+
+## Named handles for the candidates carried into next section.
+gi_broth  <- m_broth$GI$fit
+gi2_broth <- m_broth$GI_m2$fit
+g_soil    <- m_soil$G$fit
+gi_soil   <- m_soil$GI$fit
+gi2_soil  <- m_soil$GI_m2$fit
+```
+
+## Basis Dimension and Residual Checks
+
+```{r}
+tibble::tibble(
+  model = c("broth GI", "soil G", "soil GI"),
+  sigma = c(get_sigma(gi_broth), get_sigma(g_soil), get_sigma(gi_soil))
+)
+
+k.check(gi_broth)
+k.check(g_soil)
+k.check(gi_soil)
+
+resid_df <- function(m, data, label) {
+  data %>%
+    mutate(model  = label,
+           fitted = as.vector(predict(m)),
+           resid  = as.vector(residuals(m, type = "deviance")))
+}
+
+rd <- bind_rows(
+  resid_df(gi_broth, ft_broth, "broth GI"),
+  resid_df(g_soil,   ft_soil,  "soil G"),
+  resid_df(gi_soil,  ft_soil,  "soil GI")
+)
+
+ggplot(rd, aes(fitted, resid, shape = censored)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(alpha = 0.5, size = 1.3) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.6, colour = "firebrick") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2),
+                     labels = c("detected", "below LOD")) +
+  facet_wrap(~ model, scales = "free") +
+  labs(x = "Fitted value", y = "Deviance residual", shape = NULL) +
+  theme(legend.position = "bottom")
+
+ggplot(rd, aes(time, resid, colour = strain, shape = censored)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(alpha = 0.6, size = 1.2) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2), guide = "none") +
+  facet_wrap(~ model, scales = "free_y") +
+  labs(x = "Day", y = "Deviance residual", colour = "Strain")
+
+ggplot(rd, aes(sample = resid)) +
+  stat_qq(size = 1) + stat_qq_line(colour = "firebrick") +
+  facet_wrap(~ model, scales = "free") +
+  labs(x = "Theoretical quantile", y = "Deviance residual")
+```
+
+## Detection-Pattern Check (Soil Only)
+
+```{r}
+## AIC does not heavily weight censored observations, so the soil candidates
+## are also scored on their ability to reproduce the observed non-detections.
+detect_check <- function(m, label, wts = NULL) {
+  sd_i <- if (is.null(wts)) get_sigma(m) else get_sigma(m) / sqrt(wts)
+  ft_soil %>%
+    mutate(model   = label,
+           mu      = as.vector(predict(m)),
+           y_lod   = log10(lod) - log10_baseline,
+           p_below = pnorm(y_lod, mean = mu, sd = sd_i))
+}
+
+dc <- bind_rows(detect_check(g_soil,   "G"),
+                detect_check(gi_soil,  "GI"),
+                detect_check(gi2_soil, "GI_m2"))
+
+ggplot(dc %>% group_by(model, strain, time) %>%
+         summarise(observed = sum(censored), expected = sum(p_below),
+                   .groups = "drop"),
+       aes(time)) +
+  geom_line(aes(y = observed), colour = "grey30", linewidth = 0.9) +
+  geom_point(aes(y = observed), colour = "grey30", size = 1.3) +
+  geom_line(aes(y = expected, colour = model), linewidth = 0.8) +
+  facet_wrap(~ strain, labeller = labeller(strain = strain_labs), ncol = 3) +
+  labs(x = "Day", y = "Replicates below LOD (of 3)",
+       colour = "Model predicted", subtitle = "Grey = observed") +
+  theme(legend.position = "bottom")
+
+dc %>%
+  group_by(strain, model) %>%
+  summarise(observed = sum(censored),
+            expected = round(sum(p_below), 1), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = model, values_from = expected,
+                     names_prefix = "expected_", id_cols = c(strain, observed))
+
+bind_rows(score_detect(dc, "all"), score_detect(filter(dc, measured), "plated only"))
+
+## Calibration
+dc %>%
+  mutate(bin = cut(p_below, breaks = seq(0, 1, 0.2), include.lowest = TRUE)) %>%
+  group_by(model, bin) %>%
+  summarise(n = n(), mean_p = round(mean(p_below), 3),
+            obs_rate = round(mean(censored), 3), .groups = "drop")
+```
+
+> **Selection outcome.** GI — a global smooth plus group-level smooths with
+> separate smoothing parameters — is carried forward for both media. The two
+> variations below are fitted on that same structure based on agreement in AIC and detection scores.
+
+## Variation 1: Soil GI w/ Time-Varying Residual Scale
+
+```{r}
+# ---- Stage 1: estimate how residual scale changes with time ----------------
+## Residuals only exist for uncensored observations, so the scale model is
+## built from those and extrapolated. Modeled against time rather than fitted
+## value because time is observed for every row, including censored ones.
+soil_resid <- ft_soil %>%
+  mutate(mu = as.vector(predict(gi_soil)), r = y_obs - mu) %>%
+  filter(!censored)
+
+nrow(soil_resid)   # 171 of 234
+
+scale_mod <- gam(I(r^2) ~ s(time, k = 5), data = soil_resid,
+                 family = Gamma(link = "log"), method = "REML")
+summary(scale_mod)
+
+scale_grid <- data.frame(time = seq(0, TMAX, length.out = 200))
+scale_grid$sd_hat <- sqrt(as.vector(predict(scale_mod, newdata = scale_grid,
+                                            type = "response")))
+
+ggplot(scale_grid, aes(time, sd_hat)) +
+  geom_point(data = filter(cell_stats, medium == "soil"),
+             aes(time, sd_y), inherit.aes = FALSE, alpha = 0.55, size = 1.4) +
+  geom_line(linewidth = 0.9, colour = "firebrick") +
+  geom_hline(yintercept = get_sigma(gi_soil), linetype = 2, colour = "grey40") +
+  labs(x = "Day", y = "Residual SD (log10 units)",
+       subtitle = "Red = fitted scale model; points = observed cell SDs; dashed = single sigma")
+
+# ---- Stage 2: refit GI with inverse-variance prior weights -----------------
+ft_soil_w <- ft_soil
+ft_soil_w$var_hat <- as.vector(predict(scale_mod, newdata = ft_soil_w,
+                                       type = "response"))
+ft_soil_w$w <- 1 / ft_soil_w$var_hat
+ft_soil_w$w <- ft_soil_w$w / mean(ft_soil_w$w)
+
+ft_soil_w %>%
+  group_by(time) %>%
+  summarise(w = round(first(w), 3), sd_implied = round(sqrt(first(var_hat)), 3),
+            .groups = "drop")
+
+gi_soil_w <- gam(update(hgam_forms$GI, cbind(y_obs, y_cens) ~ .),
+                 data = ft_soil_w, family = cnorm(), weights = w,
+                 method = "REML")
+
+tibble::tibble(
+  fit   = c("GI unweighted", "GI weighted"),
+  sigma = c(get_sigma(gi_soil), get_sigma(gi_soil_w)),
+  edf   = c(sum(gi_soil$edf),   sum(gi_soil_w$edf))
+)
+
+k.check(gi_soil_w)
+
+# ---- Did the weighting flatten the residual spread? ------------------------
+ft_soil_w %>%
+  mutate(mu = as.vector(predict(gi_soil_w)), r = y_obs - mu,
+         rstd = r * sqrt(w)) %>%
+  filter(!censored) %>%
+  ggplot(aes(time, rstd)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(aes(colour = strain), alpha = 0.65, size = 1.3) +
+  geom_smooth(aes(y = abs(rstd)), method = "loess", se = FALSE,
+              colour = "firebrick", linewidth = 0.7) +
+  labs(x = "Day", y = "Weighted residual",
+       subtitle = "Red = loess of |residual|; should now be roughly flat")
+
+# ---- Weighted vs unweighted curves and detection scores -------------------
+bind_rows(pred_grid(gi_soil,   newd, "unweighted", tag = "wt"),
+          pred_grid(gi_soil_w, newd, "weighted",   tag = "wt")) %>%
+  ggplot(aes(time, fit, colour = wt, fill = wt)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_hline(yintercept = THR_REL, colour = "firebrick", linewidth = 0.5) +
+  geom_ribbon(aes(ymin = fit - 2 * se, ymax = fit + 2 * se),
+              alpha = 0.18, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = ft_soil, aes(time, y_obs, shape = censored),
+             inherit.aes = FALSE, alpha = 0.3, size = 1) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2), guide = "none") +
+  coord_cartesian(ylim = Y_WINDOW) +
+  facet_wrap(~ strain, labeller = labeller(strain = strain_labs), ncol = 3) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline),
+       colour = NULL, fill = NULL, title = "Soil GI: weighted vs unweighted") +
+  theme(legend.position = "bottom")
+
+dc2 <- bind_rows(detect_check(gi_soil, "GI unweighted"),
+                 detect_check(gi_soil_w, "GI weighted", wts = ft_soil_w$w))
+
+dc2 %>%
+  group_by(strain, model) %>%
+  summarise(observed = sum(censored),
+            expected = round(sum(p_below), 1), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = model, values_from = expected,
+                     id_cols = c(strain, observed))
+
+bind_rows(score_detect(dc2, "all"), score_detect(filter(dc2, measured), "plated only"))
+```
+## Variation 1b: Strain Smooths vs the Global Smooth
+
+```{r}
+# ---- Weighted GI_m2, same prior weights as gi_soil_w ----------------------
+gi2_soil_w <- gam(update(hgam_forms$GI_m2, cbind(y_obs, y_cens) ~ .),
+                  data = ft_soil_w, family = cnorm(), weights = w,
+                  method = "REML")
+k.check(gi2_soil_w)
+
+# ---- Per-strain edf: penalty order x weighting ----------------------------
+edf_terms <- function(m) {
+  s <- summary(m)$s.table
+  tibble::tibble(term = rownames(s), edf = s[, "edf"])
+}
+bind_rows(
+  edf_terms(gi_soil)    %>% mutate(fit = "GI m=1, unweighted"),
+  edf_terms(gi_soil_w)  %>% mutate(fit = "GI m=1, weighted"),
+  edf_terms(gi2_soil)   %>% mutate(fit = "GI m=2, unweighted"),
+  edf_terms(gi2_soil_w) %>% mutate(fit = "GI m=2, weighted")
+) %>%
+  mutate(edf = round(edf, 3)) %>%
+  tidyr::pivot_wider(names_from = fit, values_from = edf)
+
+tibble::tibble(
+  fit = c("GI m=1, weighted", "GI m=2, weighted"),
+  AIC = c(AIC(gi_soil_w), AIC(gi2_soil_w)),
+  aic_ok = c(cnorm_aic_ok(gi_soil_w), cnorm_aic_ok(gi2_soil_w))
+) %>% mutate(dAIC = AIC - min(AIC), .after = AIC)
+
+score_detect(bind_rows(detect_check(gi_soil_w,  "GI m=1, weighted", ft_soil_w$w),
+                       detect_check(gi2_soil_w, "GI m=2, weighted", ft_soil_w$w)),
+             "all")
+
+# ---- Global-only vs full GI curve, against the raw data -------------------
+## The global term comes from the same fit (type = "terms"); with pc = 0 and no
+## intercept the full fit is exactly global + strain deviation.
+global_vs_group <- function(m, nd, label) {
+  pt  <- predict(m, newdata = nd, type = "terms", se.fit = TRUE)
+  pf  <- predict(m, newdata = nd, se.fit = TRUE)
+  col <- match(paste0("s(time):strain", nd$strain), colnames(pt$fit))
+  idx <- cbind(seq_len(nrow(nd)), col)
+  tibble::tibble(nd, model = label,
+                 global  = pt$fit[, "s(time)"],
+                 dev     = pt$fit[idx], dev_se = pt$se.fit[idx],
+                 full    = as.vector(pf$fit), full_se = as.vector(pf$se.fit))
+}
+
+nd_check <- expand.grid(time = seq(0, TMAX, by = 0.5),
+                        strain = factor(levels(ft_soil$strain),
+                                        levels = levels(ft_soil$strain)))
+
+gv <- bind_rows(global_vs_group(gi_soil,    nd_check, "GI m=1, unweighted"),
+                global_vs_group(gi_soil_w,  nd_check, "GI m=1, weighted"),
+                global_vs_group(gi2_soil_w, nd_check, "GI m=2, weighted")) %>%
+  mutate(model = factor(model, levels = unique(model)))
+
+ggplot(filter(gv, model != "GI m=2, weighted"), aes(time)) +
+  geom_hline(yintercept = THR_REL, colour = "firebrick", linewidth = 0.4) +
+  geom_point(data = ft_soil, aes(time, y_obs, shape = censored),
+             alpha = 0.5, size = 1.1) +
+  geom_ribbon(aes(ymin = full - 2 * full_se, ymax = full + 2 * full_se),
+              fill = "steelblue", alpha = 0.15) +
+  geom_line(aes(y = global, colour = "Global smooth only"),
+            linewidth = 0.7, linetype = 2) +
+  geom_line(aes(y = full, colour = "GI (global + strain)"), linewidth = 0.8) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 2),
+                     labels = c("detected", "below LOD"), name = NULL) +
+  scale_colour_manual(values = c("GI (global + strain)" = "steelblue",
+                                 "Global smooth only"   = "grey20"), name = NULL) +
+  coord_cartesian(ylim = Y_WINDOW) +
+  facet_grid(model ~ strain, labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline)) +
+  theme(legend.position = "bottom")
+
+## Strain deviation from the global smooth, +/- 2 SE. A band that covers 0
+## throughout = the strain's trajectory is not distinguishable from the
+## shared trend.
+ggplot(gv, aes(time, dev)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_ribbon(aes(ymin = dev - 2 * dev_se, ymax = dev + 2 * dev_se), alpha = 0.25) +
+  geom_line() +
+  coord_cartesian(ylim = c(-4, 3)) +
+  facet_grid(model ~ strain, labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day", y = "Strain deviation from global smooth")
+```
+
+
+## Variation 2: Broth on the Absolute Scale
+
+```{r}
+## Broth replicates grew to similar plateau concentrations from more variable
+## baselines, so fold change undervalues strains that started higher. Same GI
+## structure, no point constraint (curves do not share an origin), strain as a
+## parametric term.
+ft_broth %>%
+  group_by(strain) %>%
+  summarise(baseline = round(first(log10_baseline), 2),
+            peak_obs = round(max(y_abs), 2), .groups = "drop") %>%
+  mutate(fold = round(peak_obs - baseline, 2))
+
+m_broth_abs <- gam(
+  y_abs ~ strain + s(time, k = K_GLOBAL, m = 2) +
+                   s(time, by = strain, k = K_GROUP, m = 1),
+  data = ft_broth, family = gaussian(), method = "REML"
+)
+
+k.check(m_broth_abs)
+summary(m_broth_abs)$dev.expl
+```
+
+# Derived Quantities and Model Inference
+
+## Prediction Grids and Posterior Draws
+
+```{r}
+set.seed(SEED)
+
+t_grid <- seq(0, TMAX, by = GRID_STEP)
+
+nd_soil  <- expand.grid(time = t_grid,
+                        strain = factor(levels(ft_soil$strain),
+                                        levels = levels(ft_soil$strain)))
+nd_broth <- expand.grid(time = t_grid,
+                        strain = factor(levels(ft_broth$strain),
+                                        levels = levels(ft_broth$strain)))
+
+## The weighted soil fit is the one retained for interpretation (Variation 1),
+## so the unweighted fit is not carried past model validation.
+D_soil_w    <- post_draws(gi_soil_w,   nd_soil)    # soil, relative scale
+D_broth     <- post_draws(gi_broth,    nd_broth)   # broth, relative scale
+D_broth_abs <- post_draws(m_broth_abs, nd_broth)   # broth, absolute (sensitivity)
+
+dim(D_soil_w)
+```
+
+## Per-Draw Metrics
+
+```{r}
+# ---- Relative scale: the same three metrics for both media ----------------
+rel_stats <- bind_rows(
+  metric_set(D_soil_w, nd_soil,  "strain", THR_REL) %>% mutate(medium = "soil"),
+  metric_set(D_broth,  nd_broth, "strain", THR_REL) %>% mutate(medium = "broth")
+)
+
+# ---- Absolute-scale broth, sensitivity only -------------------------------
+abs_stats <- metric_set(D_broth_abs, nd_broth, "strain", THR_BROTH_ABS) %>%
+  mutate(medium = "broth (absolute)")
+```
+
+## Metric Summaries
+
+```{r}
+## p_above is the posterior probability that the expected value is still above
+## the threshold at day 100, i.e. that the population has NOT yet fallen by a
+## full 4 logs (relative scale) or below 0 (absolute scale).
+## Time-to-threshold is suppressed where fewer than P_CROSSED of draws cross.
+metric_summary <- bind_rows(rel_stats, abs_stats) %>%
+  group_by(medium, stat) %>%
+  group_modify(~ summarise_stat(.x, "strain")) %>%
+  ungroup() %>%
+  mutate(reportable = !(grepl("^time to", stat) & p_crossed < P_CROSSED),
+         across(c(median, q25, q75, lwr, upr),
+                ~ ifelse(reportable, .x, NA_real_)))
+
+print(metric_summary %>%
+        select(medium, stat, strain, p_above, p_crossed, reportable,
+               median, q25, q75, lwr, upr),
+      n = Inf, width = Inf)
+
+ggplot(filter(rel_stats, stat == "AUC"), aes(value)) +
+  geom_histogram(bins = 60) +
+  facet_grid(medium ~ strain, scales = "free",
+             labeller = labeller(strain = strain_labs)) +
+  labs(x = expression(AUC~above~-4~log*-fold~change~(log[10]%*%~days)), y = "Draws")
+```
+
+## Pairwise Contrasts
+
+```{r}
+rel_contrasts <- rel_stats %>%
+  group_by(medium, stat) %>%
+  group_modify(~ contrast_draws(.x, "strain", "x") %>% select(-stat)) %>%
+  ungroup()
+
+print(rel_contrasts %>% select(medium, stat, contrast, n_usable,
+                               median, lwr, upr, p_gt0, excludes_0),
+      n = Inf, width = Inf)
+```
+
+## Sensitivity: Broth on the Absolute Scale
+
+```{r}
+## Does modelling broth on the absolute scale change which strains differ?
+## Contrasts are compared against the primary relative-scale broth model.
+abs_contrasts <- abs_stats %>%
+  group_by(medium, stat) %>%
+  group_modify(~ contrast_draws(.x, "strain", "x") %>% select(-stat)) %>%
+  ungroup()
+
+print(abs_contrasts %>% select(stat, contrast, median, lwr, upr, excludes_0),
+      n = Inf, width = Inf)
+
+broth_sens <- bind_rows(lapply(unique(abs_contrasts$stat), function(st) {
+  sens_agree(rel_contrasts %>% filter(medium == "broth", stat == st),
+             abs_contrasts %>% filter(stat == st),
+             st, c("relative", "absolute"))
+}))
+
+broth_sens %>% count(stat, agree)
+broth_sens %>% filter(!agree) %>% print(n = Inf, width = Inf)
+```
+
+## Sensitivity: Common Floor Threshold (Soil)
+
+```{r}
+## Strains 1, 3 and 6 (and strain 2, by 0.03 log) have detection floors above
+## -4 log, so part of the area, margin and crossing time measured against -4
+## lies below anything the assay could detect for them. Here every strain is
+## referenced to the highest soil detection floor (-3.59, strain 1): a level
+## all six series could resolve directly, so the metrics stay comparable
+## across strains. No refit; only the reference level changes.
+soil_floors <- lod_rel %>%
+  filter(medium == "soil", group == "exp") %>%
+  arrange(strain) %>%
+  transmute(strain, own_floor = y_lod)
+
+THR_COMMON <- max(soil_floors$own_floor)
+
+soil_floors %>% mutate(own_floor = round(own_floor, 3))
+round(THR_COMMON, 3)
+
+common_stats <- metric_set(D_soil_w, nd_soil, "strain", THR_COMMON,
+                           ttt_label = "time to threshold")
+
+common_summary <- common_stats %>%
+  group_by(stat) %>%
+  group_modify(~ summarise_stat(.x, "strain")) %>%
+  ungroup() %>%
+  mutate(reportable = !(grepl("^time to", stat) & p_crossed < P_CROSSED))
+
+print(common_summary %>%
+        select(stat, strain, p_above, p_crossed, reportable, median, lwr, upr),
+      n = Inf, width = Inf)
+
+common_contrasts <- common_stats %>%
+  group_by(stat) %>%
+  group_modify(~ contrast_draws(.x, "strain", "x") %>% select(-stat)) %>%
+  ungroup()
+
+## Primary (-4) soil contrasts, relabelled so the metric names line up
+rel_soil <- rel_contrasts %>%
+  filter(medium == "soil") %>%
+  mutate(stat = sub("^time to.*", "time to threshold", stat))
+
+common_sens <- sens_agree_all(rel_soil, common_contrasts, c("thr_minus4", "common"))
+
+common_sens %>% count(stat, agree)
+
+## Any contrast that changed, shown in full under both thresholds
+flipped <- filter(common_sens, !agree) %>% select(stat, contrast)
+bind_rows(
+  semi_join(rel_soil,         flipped, by = c("stat", "contrast")) %>% mutate(threshold = "-4"),
+  semi_join(common_contrasts, flipped, by = c("stat", "contrast")) %>% mutate(threshold = "common")
+) %>%
+  select(stat, contrast, threshold, n_usable, median, lwr, upr, p_gt0, excludes_0) %>%
+  arrange(stat, contrast, threshold) %>%
+  print(n = Inf, width = Inf)
+
+## Supplementary-table strings for this sensitivity ("NA; x%" TTR format)
+common_summary %>%
+  mutate(cell = ifelse(grepl("^time to", stat),
+                       fmt_ttr(median, lwr, upr, p_crossed, reportable),
+                       fmt_est(median, lwr, upr))) %>%
+  select(strain, stat, cell) %>%
+  tidyr::pivot_wider(names_from = stat, values_from = cell)
+```
+
+# Constant-Temperature Controls
+
+## Control Dataset
+
+```{r}
+set.seed(SEED)
+
+ft_ctrl <- ft %>%
+  filter(strain %in% c("4", "6")) %>%
+  droplevels() %>%
+  mutate(sg = interaction(strain, group, drop = TRUE, sep = "_"))
+
+ctrl_soil  <- filter(ft_ctrl, medium == "soil")  %>% droplevels()
+ctrl_broth <- filter(ft_ctrl, medium == "broth") %>% droplevels()
+
+levels(ft_ctrl$sg)
+
+ft_ctrl %>%
+  group_by(medium, group) %>%
+  summarise(n = n(), n_censored = sum(censored), .groups = "drop")
+
+ctrl_broth %>%
+  filter(time == 0) %>%
+  group_by(sg) %>%
+  summarise(baseline_log10 = round(mean(y_abs), 2), .groups = "drop")
+
+## The regime comparisons made within each strain
+ctrl_pairs <- list(
+  c("4_exp",     "4_plus10C"),
+  c("4_exp",     "4_minus10C"),
+  c("4_plus10C", "4_minus10C"),
+  c("6_exp",     "6_plus10C"),
+  c("6_exp",     "6_minus10C"),
+  c("6_plus10C", "6_minus10C")
+)
+```
+
+## Models
+
+```{r}
+## Same GI structure as before, with the six-level strain x regime factor as
+## the grouping variable.
+
+## The soil fit below is the UNWEIGHTED model. It exists only to supply
+## residuals to the scale model in the next chunk; m_ctrl_soil_w is what carries
+## the control-arm inference, matching the treatment of gi_soil_w in the
+## cycling arm (Variation 1).
+m_ctrl_soil <- gam(
+  cbind(y_obs, y_cens) ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+                         s(time, by = sg, k = K_GROUP, m = 1, pc = 0) - 1,
+  data = ctrl_soil, family = cnorm(), method = "REML"
+)
+
+m_ctrl_broth <- gam(
+  y_obs ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+          s(time, by = sg, k = K_GROUP, m = 1, pc = 0) - 1,
+  data = ctrl_broth, family = gaussian(), method = "REML"
+)
+
+## Absolute scale
+m_ctrl_broth_abs <- gam(
+  y_abs ~ sg + s(time, k = K_GLOBAL, m = 2) + s(time, by = sg, k = K_GROUP, m = 1),
+  data = ctrl_broth, family = gaussian(), method = "REML"
+)
+
+## Broth is left unweighted in both arms
+lapply(list(broth_rel = m_ctrl_broth, broth_abs = m_ctrl_broth_abs), k.check)
+```
+
+## Variation: Control Soil w/ Time-Varying Residual Scale
+
+```{r}
+ # ---- Stage 1: regime-specific residual scale -------------------------------
+## Pooling cycling and constant series flattens the variance ramp: the four
+## constant-temperature series are tight throughout (0 of 156 non-detections)
+## and dominate a single s(time). Fit the two regimes separately.
+ctrl_soil_resid <- ctrl_soil %>%
+  mutate(mu = as.vector(predict(m_ctrl_soil)), r = y_obs - mu) %>%
+  filter(!censored) %>%
+  mutate(regime = factor(ifelse(grepl("exp$", sg), "cycling", "constant"),
+                         levels = c("cycling", "constant")))
+
+table(ctrl_soil_resid$regime)
+
+scale_mod_ctrl <- gam(I(r^2) ~ regime + s(time, k = 5, by = regime),
+                      data = ctrl_soil_resid,
+                      family = Gamma(link = "log"), method = "REML")
+summary(scale_mod_ctrl)
+k.check(scale_mod_ctrl)        # drop to k = 4 if the cycling smooth complains
+
+# ---- Fitted scale, by regime ----------------------------------------------
+## The grid needs a regime column now that the scale model has a by term.
+scale_grid_ctrl <- expand.grid(
+  time   = seq(0, TMAX, length.out = 200),
+  regime = factor(c("cycling", "constant"), levels = c("cycling", "constant"))
+)
+scale_grid_ctrl$sd_hat <- sqrt(as.vector(
+  predict(scale_mod_ctrl, newdata = scale_grid_ctrl, type = "response")))
+
+ggplot(scale_grid_ctrl, aes(time, sd_hat, colour = regime)) +
+  geom_point(data = ctrl_soil %>%
+               mutate(regime = factor(ifelse(grepl("exp$", sg), "cycling", "constant"),
+                                      levels = c("cycling", "constant"))) %>%
+               group_by(sg, regime, time) %>%
+               summarise(sd_y = sd(y_obs), .groups = "drop"),
+             aes(time, sd_y, colour = regime), inherit.aes = FALSE,
+             alpha = 0.55, size = 1.4) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = get_sigma(m_ctrl_soil), linetype = 2, colour = "grey40") +
+  labs(x = "Day", y = "Residual SD (log10 units)", colour = NULL,
+       subtitle = "Lines = fitted scale model; dashed = single sigma from the unweighted fit")
+
+# ---- Stage 2: refit GI with inverse-variance prior weights -----------------
+## regime must be present here too, for the predict() call below.
+ctrl_soil_w <- ctrl_soil %>%
+  mutate(regime = factor(ifelse(grepl("exp$", sg), "cycling", "constant"),
+                         levels = c("cycling", "constant")))
+
+ctrl_soil_w$var_hat <- as.vector(predict(scale_mod_ctrl, newdata = ctrl_soil_w,
+                                         type = "response"))
+ctrl_soil_w$w <- 1 / ctrl_soil_w$var_hat
+ctrl_soil_w$w <- ctrl_soil_w$w / mean(ctrl_soil_w$w)
+
+ctrl_soil_w %>%
+  group_by(regime, time) %>%
+  summarise(w = round(first(w), 3), sd_implied = round(sqrt(first(var_hat)), 3),
+            .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = regime, values_from = c(w, sd_implied))
+
+## THE MODEL ITSELF -- everything below depends on this line
+m_ctrl_soil_w <- gam(
+  cbind(y_obs, y_cens) ~ s(time, k = K_GLOBAL, m = 2, pc = 0) +
+                         s(time, by = sg, k = K_GROUP, m = 1, pc = 0) - 1,
+  data = ctrl_soil_w, family = cnorm(), weights = w, method = "REML"
+)
+
+tibble::tibble(
+  fit   = c("control soil unweighted", "control soil weighted"),
+  sigma = c(get_sigma(m_ctrl_soil), get_sigma(m_ctrl_soil_w)),
+  edf   = c(sum(m_ctrl_soil$edf),   sum(m_ctrl_soil_w$edf))
+)
+
+k.check(m_ctrl_soil_w)
+
+# ---- Did the weighting flatten the residual spread? ------------------------
+ctrl_soil_w %>%
+  mutate(mu = as.vector(predict(m_ctrl_soil_w)), r = y_obs - mu,
+         rstd = r * sqrt(w)) %>%
+  filter(!censored) %>%
+  ggplot(aes(time, rstd)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(aes(colour = sg), alpha = 0.65, size = 1.3) +
+  geom_smooth(aes(y = abs(rstd)), method = "loess", se = FALSE,
+              colour = "firebrick", linewidth = 0.7) +
+  labs(x = "Day", y = "Weighted residual", colour = NULL,
+       subtitle = "Red = loess of |residual|; should now be roughly flat")
+
+# ---- Detection scores, weighted vs unweighted ------------------------------
+## Prior weights scale the per-observation SD as sigma / sqrt(w).
+detect_check_ctrl <- function(m, label, wts = NULL) {
+  sd_i <- if (is.null(wts)) get_sigma(m) else get_sigma(m) / sqrt(wts)
+  ctrl_soil %>%
+    mutate(model   = label,
+           mu      = as.vector(predict(m, newdata = ctrl_soil)),
+           y_lod   = log10(lod) - log10_baseline,
+           p_below = pnorm(y_lod, mean = mu, sd = sd_i))
+}
+
+dc_ctrl <- bind_rows(
+  detect_check_ctrl(m_ctrl_soil,   "unweighted"),
+  detect_check_ctrl(m_ctrl_soil_w, "weighted", wts = ctrl_soil_w$w)
+)
+
+score_detect(dc_ctrl, "control soil")
+
+dc_ctrl %>%
+  group_by(sg, model) %>%
+  summarise(observed = sum(censored),
+            expected = round(sum(p_below), 1), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = model, values_from = expected,
+                     names_prefix = "expected_", id_cols = c(sg, observed))
+```
+
+
+## Posterior Draws and Metrics
+
+```{r}
+nd_ctrl_soil  <- expand.grid(time = t_grid,
+                             sg = factor(levels(ctrl_soil_w$sg),
+                                         levels = levels(ctrl_soil_w$sg)))
+nd_ctrl_broth <- expand.grid(time = t_grid,
+                             sg = factor(levels(ctrl_broth$sg),
+                                         levels = levels(ctrl_broth$sg)))
+
+Dc_soil      <- post_draws(m_ctrl_soil_w,   nd_ctrl_soil)
+Dc_broth     <- post_draws(m_ctrl_broth,    nd_ctrl_broth)
+Dc_broth_abs <- post_draws(m_ctrl_broth_abs, nd_ctrl_broth)
+
+## Same three metrics as the cycling arm, same thresholds.
+ctrl_stats <- bind_rows(
+  metric_set(Dc_soil,  nd_ctrl_soil,  "sg", THR_REL) %>% mutate(medium = "soil"),
+  metric_set(Dc_broth, nd_ctrl_broth, "sg", THR_REL) %>% mutate(medium = "broth")
+)
+
+## Absolute-scale broth, sensitivity only
+ctrl_abs_stats <- metric_set(Dc_broth_abs, nd_ctrl_broth, "sg", THR_BROTH_ABS) %>%
+  mutate(medium = "broth (absolute)")
+
+ctrl_summary <- bind_rows(ctrl_stats, ctrl_abs_stats) %>%
+  group_by(medium, stat) %>%
+  group_modify(~ summarise_stat(.x, "sg")) %>%
+  ungroup() %>%
+  mutate(reportable = !(grepl("^time to", stat) & p_crossed < P_CROSSED),
+         across(c(median, q25, q75, lwr, upr),
+                ~ ifelse(reportable, .x, NA_real_)))
+
+print(ctrl_summary %>% select(medium, stat, sg, p_above, p_crossed, reportable,
+                              median, q25, q75, lwr, upr),
+      n = Inf, width = Inf)
+```
+
+## Within-Strain Regime Contrasts
+
+```{r}
+ctrl_contrasts <- ctrl_stats %>%
+  group_by(medium, stat) %>%
+  group_modify(~ contrast_draws(.x, "sg", "x", ctrl_pairs) %>% select(-stat)) %>%
+  ungroup()
+
+print(ctrl_contrasts %>% select(medium, stat, contrast, n_usable,
+                                median, lwr, upr, p_gt0, excludes_0),
+      n = Inf, width = Inf)
+
+## Absolute-scale broth sensitivity: same regime comparisons, compared against
+## the primary relative-scale broth model.
+ctrl_abs_contrasts <- ctrl_abs_stats %>%
+  group_by(medium, stat) %>%
+  group_modify(~ contrast_draws(.x, "sg", "x", ctrl_pairs) %>% select(-stat)) %>%
+  ungroup()
+
+print(ctrl_abs_contrasts %>% select(stat, contrast, median, lwr, upr, excludes_0),
+      n = Inf, width = Inf)
+
+bind_rows(lapply(unique(ctrl_abs_contrasts$stat), function(st) {
+  sens_agree(ctrl_contrasts     %>% filter(medium == "broth", stat == st),
+             ctrl_abs_contrasts %>% filter(stat == st),
+             st, c("relative", "absolute"))
+})) %>% count(stat, agree)
+```
+
+## Control Diagnostic Plots
+
+```{r}
+bind_rows(
+  pred_grid(m_ctrl_soil_w, nd_ctrl_soil,  "soil (relative)",  tag = "panel"),
+  pred_grid(m_ctrl_broth,  nd_ctrl_broth, "broth (relative)", tag = "panel")
+) %>%
+  tidyr::separate(sg, into = c("strain", "group"), sep = "_", remove = FALSE) %>%
+  mutate(group  = factor(group, levels = c("exp", "plus10C", "minus10C")),
+         strain = factor(strain, levels = levels(ft_ctrl$strain))) %>%
+  ggplot(aes(time, fit, colour = group, fill = group)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_ribbon(aes(ymin = fit - 2 * se, ymax = fit + 2 * se),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = ft_ctrl, aes(time, y_obs, colour = group),
+             inherit.aes = FALSE, alpha = 0.3, size = 1) +
+  facet_grid(panel ~ strain, scales = "free_y",
+             labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day", y = expression(log[10]~fold~change~from~baseline),
+       colour = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+
+pred_grid(m_ctrl_broth_abs, nd_ctrl_broth, "broth (absolute)", tag = "panel") %>%
+  tidyr::separate(sg, into = c("strain", "group"), sep = "_", remove = FALSE) %>%
+  mutate(group  = factor(group, levels = c("exp", "plus10C", "minus10C")),
+         strain = factor(strain, levels = levels(ft_ctrl$strain))) %>%
+  ggplot(aes(time, fit, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = fit - 2 * se, ymax = fit + 2 * se),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = ctrl_broth, aes(time, y_abs, colour = group),
+             inherit.aes = FALSE, alpha = 0.3, size = 1) +
+  facet_wrap(~ strain, labeller = labeller(strain = strain_labs)) +
+  labs(x = "Day", y = expression(log[10]~CFU~mL^-1),
+       colour = NULL, fill = NULL, title = "Broth on the absolute scale") +
+  theme(legend.position = "bottom")
+```
+
+# Figures
+
+## Style
+
+```{r}
+lw <- function(pt) pt / .pt
+
+STRAIN_COL <- c(`1` = "#E69F00", `2` = "#56B4E9", `3` = "#009E73",
+                `4` = "#0072B2", `5` = "#D55E00", `6` = "#CC79A7")
+
+STRAIN_LTY <- c(`1` = "42",   `2` = "22",   `3` = "1343",
+                `4` = "44",   `5` = "solid", `6` = "73")
+
+STRAIN_LWD <- c(`1` = lw(1), `2` = lw(1), `3` = lw(1),
+                `4` = lw(1), `5` = lw(1), `6` = lw(1))
+
+FIG_LABS <- expression(
+  "1  Poultry, Belgium (clade 2)",
+  "2  Arctic fox, Victoria Is. (clade 2)",
+  "3  Swine, Belgium (clade 3)",
+  "4  Muskox, Ellesmere Is. (clade 3)",
+  "5  Muskox, Ellesmere Is. (clade 3, Arctic clone)",
+  "6  " * italic("E. qupirruqcola") * ", Ellesmere Is."
+)
+
+PANEL_LABS <- c(broth = "(a)  Broth", soil = "(b)  Soil")
+
+## Legend fills down the first column (1,2,3) then the second (4,5,6)
+strain_guide <- guide_legend(ncol = 2, byrow = FALSE)
+
+## 4 log10 reduction reference line
+THR_COL <- "grey10"
+THR_LWD <- lw(2.0)
+
+Y_FLOOR_SOIL <- -5      # soil ribbons squished to this floor, not dropped
+
+theme_fig <- theme_bw(base_size = 8, base_family = "") +
+  theme(
+    panel.grid.minor  = element_blank(),
+    panel.grid.major  = element_line(linewidth = lw(0.25), colour = "grey88"),
+    panel.border      = element_rect(linewidth = lw(0.5), colour = "grey20"),
+    axis.text         = element_text(size = 7, colour = "black"),
+    axis.title        = element_text(size = 8),
+    axis.ticks        = element_line(linewidth = lw(0.5), colour = "grey20"),
+    strip.background  = element_blank(),
+    strip.text        = element_text(size = 8, hjust = 0, face = "bold",
+                                     margin = margin(b = 3)),
+    legend.text       = element_text(size = 7),
+    legend.title      = element_blank(),
+    legend.key.width  = unit(11, "mm"),
+    legend.key.height = unit(3.5, "mm"),
+    legend.margin     = margin(t = 0),
+    legend.position   = "bottom",
+    plot.margin       = margin(2, 4, 2, 2)
+  )
+```
+
+## Fig. 1
+
+```{r}
+## Median and 95% interval of the posterior at every grid point.
+ribbon_from_draws <- function(D, nd, medium_label) {
+  q <- t(apply(D, 1, quantile, probs = c(0.025, 0.5, 0.975)))
+  tibble::tibble(
+    medium = factor(medium_label, levels = levels(ft$medium)),
+    time   = nd$time,
+    strain = nd$strain,
+    lwr    = q[, 1],
+    med    = q[, 2],
+    upr    = q[, 3]
+  )
+}
+
+## Cut a series where its posterior median falls below `thr` for the rest of
+## the trial. Series whose median is at or above
+## thr on the last grid day are returned whole, including any earlier dips
+## below thr. The cut point is interpolated to sit exactly on thr.
+## cut_day records where each series was cut (NA = shown in full).
+cut_at_final_crossing <- function(d, gvar, thr = THR_REL) {
+  d %>%
+    group_by(across(all_of(gvar))) %>%
+    group_modify(function(g, key) {
+      g <- arrange(g, time)
+      n <- nrow(g)
+      if (g$med[n] >= thr) return(mutate(g, cut_day = NA_real_))
+      k <- max(which(g$med >= thr))               # last grid point at/above thr
+      f <- (thr - g$med[k]) / (g$med[k + 1] - g$med[k])
+      cross <- g[k, ]
+      cross$time <- g$time[k] + f * (g$time[k + 1] - g$time[k])
+      cross$lwr  <- g$lwr[k]  + f * (g$lwr[k + 1]  - g$lwr[k])
+      cross$upr  <- g$upr[k]  + f * (g$upr[k + 1]  - g$upr[k])
+      cross$med  <- thr
+      bind_rows(g[seq_len(k), ], cross) %>% mutate(cut_day = cross$time)
+    }) %>%
+    ungroup()
+}
+
+## Display-only: hide any stretch where the median runs below the plotting
+## floor (so lines end at the floor instead of being flattened along it).
+## Each visible stretch gets its own seg_id for the `group` aesthetic.
+mask_below_threshold <- function(d, gvar, thr = THR_REL) {
+  d %>%
+    group_by(across(all_of(gvar))) %>%
+    group_modify(function(g, key) {
+      g <- arrange(g, time)
+      n <- nrow(g)
+      above <- g$med >= thr
+      i <- which(above[-n] != above[-1])          # crossings between grid points
+      if (length(i) > 0) {
+        f <- (thr - g$med[i]) / (g$med[i + 1] - g$med[i])
+        cross <- g[i, ]
+        cross$time <- g$time[i] + f * (g$time[i + 1] - g$time[i])
+        cross$lwr  <- g$lwr[i]  + f * (g$lwr[i + 1]  - g$lwr[i])
+        cross$upr  <- g$upr[i]  + f * (g$upr[i + 1]  - g$upr[i])
+        cross$med  <- thr
+        g <- bind_rows(g, cross) %>% arrange(time)
+      }
+      keep  <- g$med >= thr - 1e-9
+      g$seg <- cumsum(keep & !dplyr::lag(keep, default = FALSE))
+      g[keep, ]
+    }) %>%
+    ungroup() %>%
+    mutate(seg_id = paste(.data[[gvar]], seg, sep = "_"))
+}
+
+fig1_broth <- ribbon_from_draws(D_broth, nd_broth, "broth") %>%
+  mutate(seg = 1L, seg_id = paste(strain, seg, sep = "_"))
+
+fig1_soil <- ribbon_from_draws(D_soil_w, nd_soil, "soil") %>%
+  cut_at_final_crossing("strain", thr = THR_REL) %>%
+  mask_below_threshold("strain", thr = Y_FLOOR_SOIL) %>%
+  ## Lower ribbon bounds can still hang below the floor; squish those only
+  mutate(lwr = pmax(lwr, Y_FLOOR_SOIL))
+
+fig1_dat <- bind_rows(fig1_broth, fig1_soil)
+
+## Which soil curves were cut, and where. cut_day = NA means shown in full.
+## A to_day short of 100 for an uncut strain means its median passes
+## Y_FLOOR_SOIL somewhere
+fig1_soil %>%
+  group_by(strain, seg) %>%
+  summarise(from_day = round(min(time), 1), to_day = round(max(time), 1),
+            min_med  = round(min(med), 2),
+            cut_day  = round(first(cut_day), 1), .groups = "drop")
+
+## Threshold line belongs only in the soil panel
+thr_line <- tibble::tibble(
+  medium = factor("soil", levels = levels(ft$medium)),
+  y      = THR_REL
+)
+
+fig1 <- ggplot(fig1_dat, aes(time, med, colour = strain, fill = strain)) +
+  geom_hline(yintercept = 0, linetype = "dotted",
+             linewidth = lw(0.4), colour = "grey45") +
+  geom_ribbon(aes(ymin = lwr, ymax = upr, group = seg_id),
+              alpha = 0.13, colour = NA) +
+  geom_hline(data = thr_line, aes(yintercept = y), inherit.aes = FALSE,
+             linewidth = THR_LWD, colour = THR_COL) +
+  geom_line(aes(linetype = strain, linewidth = strain, group = seg_id)) +
+  scale_colour_manual(values = STRAIN_COL, labels = FIG_LABS, name = NULL) +
+  scale_fill_manual(values = STRAIN_COL,   labels = FIG_LABS, name = NULL) +
+  scale_linetype_manual(values = STRAIN_LTY, labels = FIG_LABS, name = NULL) +
+  scale_linewidth_manual(values = STRAIN_LWD, labels = FIG_LABS, name = NULL) +
+  scale_x_continuous(breaks = seq(0, TMAX, 20), expand = expansion(mult = 0.01)) +
+  facet_wrap(~ medium, ncol = 1, scales = "free_y",
+             labeller = labeller(medium = PANEL_LABS)) +
+  labs(x = "Day (one freeze/thaw cycle per day)",
+       y = expression(log[10]~fold~change~from~baseline)) +
+  guides(colour = strain_guide, linetype = strain_guide,
+         linewidth = strain_guide, fill = "none") +
+  theme_fig
+
+fig1
+
+FIG_W <- 170   # mm, full two-column width
+FIG_H <- 145   # mm
+
+ggsave("Figure_1.pdf", fig1, width = FIG_W, height = FIG_H, units = "mm",
+       device = cairo_pdf)
+
+ggsave("Figure_1.png", fig1, width = FIG_W, height = FIG_H, units = "mm",
+       dpi = 600, device = ragg::agg_png)
+```
+## Fig. 2
+
+```{r}
+## Modeled trajectories for strains 4 and 6 under freeze/thaw cycling,
+## constant +10 C and constant -10 C, in (a) broth and (b) soil.
+## Draws come from the control models (m_ctrl_broth, m_ctrl_soil_w).
+## Color = strain; line type, opacity and width = temperature regime.
+## Soil series use the same display rule as Fig. 1.
+
+REGIME_LEVS  <- c("exp", "plus10C", "minus10C")
+REGIME_LABS  <- c(exp      = "Freeze/Thaw Cycling",
+                  plus10C  = "Constant +10\u00B0C",
+                  minus10C = "Constant \u221210\u00B0C")
+REGIME_LTY   <- c(exp = "solid", plus10C = "44",   minus10C = "13")
+REGIME_ALPHA <- c(exp = 1,       plus10C = 0.65,   minus10C = 0.65)
+REGIME_LWD   <- c(exp = lw(1.5), plus10C = lw(1.3), minus10C = lw(1.1))
+
+RIBBON_ALPHA   <- 0.10
+RIBBON_REGIMES <- REGIME_LEVS   # e.g. c("exp") to ribbon cycling only
+
+## Median and 95% interval at every grid point, split into strain and regime.
+ribbon_from_draws_sg <- function(D, nd, medium_label) {
+  q <- t(apply(D, 1, quantile, probs = c(0.025, 0.5, 0.975)))
+  tibble::tibble(
+    medium = factor(medium_label, levels = levels(ft$medium)),
+    time   = nd$time,
+    sg     = nd$sg,
+    lwr    = q[, 1],
+    med    = q[, 2],
+    upr    = q[, 3]
+  ) %>%
+    tidyr::separate(sg, into = c("strain", "group"), sep = "_", remove = FALSE) %>%
+    mutate(strain = factor(strain, levels = levels(ft$strain)),
+           group  = factor(group,  levels = REGIME_LEVS))
+}
+
+fig2_broth <- ribbon_from_draws_sg(Dc_broth, nd_ctrl_broth, "broth") %>%
+  mutate(seg = 1L, seg_id = paste(sg, seg, sep = "_"))
+
+fig2_soil <- ribbon_from_draws_sg(Dc_soil, nd_ctrl_soil, "soil") %>%
+  cut_at_final_crossing("sg", thr = THR_REL) %>%
+  mask_below_threshold("sg", thr = Y_FLOOR_SOIL) %>%
+  mutate(lwr = pmax(lwr, Y_FLOOR_SOIL))
+
+fig2_dat <- bind_rows(fig2_broth, fig2_soil)
+
+## Which soil series were cut, and where (cut_day = NA means shown in full)
+fig2_soil %>%
+  group_by(sg, seg) %>%
+  summarise(from_day = round(min(time), 1), to_day = round(max(time), 1),
+            min_med  = round(min(med), 2),
+            cut_day  = round(first(cut_day), 1), .groups = "drop")
+
+fig2 <- ggplot(fig2_dat, aes(time, med)) +
+  geom_hline(yintercept = 0, linetype = "dotted",
+             linewidth = lw(0.4), colour = "grey45") +
+  geom_ribbon(data = filter(fig2_dat, group %in% RIBBON_REGIMES),
+              aes(ymin = lwr, ymax = upr, fill = strain, group = seg_id),
+              alpha = RIBBON_ALPHA, colour = NA) +
+  geom_hline(data = thr_line, aes(yintercept = y), inherit.aes = FALSE,
+             linewidth = THR_LWD, colour = THR_COL) +
+  geom_line(aes(colour = strain, linetype = group, alpha = group,
+                linewidth = group, group = seg_id)) +
+  scale_colour_manual(values = STRAIN_COL, breaks = c("4", "6"),
+                      labels = FIG_LABS[c(4, 6)], name = NULL) +
+  scale_fill_manual(values = STRAIN_COL, guide = "none") +
+  scale_linetype_manual(values = REGIME_LTY,   labels = REGIME_LABS,
+                        breaks = REGIME_LEVS, name = NULL) +
+  scale_alpha_manual(values = REGIME_ALPHA,    labels = REGIME_LABS,
+                     breaks = REGIME_LEVS, name = NULL) +
+  scale_linewidth_manual(values = REGIME_LWD,  labels = REGIME_LABS,
+                         breaks = REGIME_LEVS, name = NULL) +
+  scale_x_continuous(breaks = seq(0, TMAX, 20), expand = expansion(mult = 0.01)) +
+  facet_wrap(~ medium, ncol = 1, scales = "free_y",
+             labeller = labeller(medium = PANEL_LABS)) +
+  labs(x = "Day",
+       y = expression(log[10]~fold~change~from~baseline)) +
+  guides(
+    colour    = guide_legend(order = 1, ncol = 1,
+                             override.aes = list(linetype = "solid", alpha = 1,
+                                                 linewidth = lw(1.1))),
+    linetype  = guide_legend(order = 2, ncol = 1,
+                             override.aes = list(colour = "grey20")),
+    alpha     = guide_legend(order = 2, ncol = 1),
+    linewidth = guide_legend(order = 2, ncol = 1)
+  ) +
+  theme_fig
+
+fig2
+
+FIG2_W <- 170   # mm, full two-column width
+FIG2_H <- 145   # mm
+
+ggsave("Figure_2.pdf", fig2, width = FIG2_W, height = FIG2_H, units = "mm",
+       device = cairo_pdf)
+
+ggsave("Figure_2.png", fig2, width = FIG2_W, height = FIG2_H, units = "mm",
+       dpi = 600, device = ragg::agg_png)
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+beep(sound = "fanfare")
+```
