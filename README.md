@@ -3,4 +3,4 @@ Repository for R code and raw data associated with the manuscript "Does freezeâ€
 
 # Prerequisites
 R and RStudio are necessary for running the R code. The following R packages are required: 
-"beepr", "dplyr", "forcats", "ggplot2", "gratia", "MASS", "mgcv", "patchwork", "ragg", "readxl", "systemfonts", and "tidyr" 
+"beepr", "dplyr", "forcats", "ggplot2", "gratia", "MASS", "mgcv", "patchwork", "ragg", "readxl", "systemfonts", "tidyr" 
